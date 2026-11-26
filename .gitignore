@@ -39,6 +39,12 @@ venv.bak/
 .env.*
 *.env
 
+# Local SQLite database
+data/
+*.db
+*.db-wal
+*.db-shm
+
 # Archives and local backups
 *.zip
 *.tar.gz

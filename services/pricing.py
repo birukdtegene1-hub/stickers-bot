@@ -1,16 +1,12 @@
-"""Pricing engine for sticker orders.
-
-Encapsulates base prices per size and tiered volume discounts.
-All monetary values are in Ethiopian Birr (ETB).
-"""
-
+"""Dynamic pricing engine for sticker orders (all monetary values in ETB)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Sequence
 
-# Base price per unit, keyed by canonical size identifier.
+from services import database as db
+
 BASE_PRICES: dict[str, Decimal] = {
     "20x20": Decimal("40"),
     "40x40": Decimal("60"),
@@ -19,22 +15,21 @@ BASE_PRICES: dict[str, Decimal] = {
     "phone_back": Decimal("80"),
 }
 
-# Discount tiers ordered from highest threshold to lowest.
-# Each tuple is (minimum_quantity, discount_percentage).
-_DISCOUNT_TIERS: list[tuple[int, int]] = [
-    (20, 15),
-    (10, 10),
-    (5, 5),
-    (1, 0),
-]
+LABELS = {
+    "20x20": "20 × 20 mm",
+    "40x40": "40 × 40 mm",
+    "60x60": "60 × 60 mm",
+    "spacebar_key": "Spacebar key",
+    "phone_back": "Phone back",
+}
 
-DEPOSIT_FRACTION = Decimal("0.50")
+MAX_QUANTITY = 999
+COLORS = ("black", "white", "silver", "pink", "blue")
+MAX_ADDRESS = 300
 
 
 @dataclass(frozen=True)
 class LineItem:
-    """Computed pricing for a single line in the order."""
-
     size: str
     unit_price: Decimal
     quantity: int
@@ -43,8 +38,6 @@ class LineItem:
 
 @dataclass(frozen=True)
 class OrderCalculation:
-    """Full pricing breakdown for an order."""
-
     line_items: list[LineItem]
     subtotal: Decimal
     total_quantity: int
@@ -55,67 +48,77 @@ class OrderCalculation:
 
 
 class PricingError(Exception):
-    """Raised when pricing cannot be computed due to invalid input."""
+    pass
+
+
+def size_prices_map(*, include_inactive: bool = False) -> dict[str, Decimal]:
+    rows = db.list_sizes(include_inactive=include_inactive)
+    if not rows:
+        return dict(BASE_PRICES)
+    return {r["key"]: Decimal(str(r["price_etb"])) for r in rows}
+
+
+def size_labels_map(*, include_inactive: bool = True) -> dict[str, str]:
+    rows = db.list_sizes(include_inactive=include_inactive)
+    merged = dict(LABELS)
+    for r in rows:
+        merged[r["key"]] = r["label"]
+    return merged
+
+
+def get_deposit_fraction() -> Decimal:
+    raw = db.get_setting("deposit_percent", "50")
+    try:
+        pct = Decimal(raw)
+        if 0 <= pct <= 100:
+            return pct / Decimal("100")
+    except Exception:
+        pass
+    return Decimal("0.50")
 
 
 def _resolve_discount(total_quantity: int) -> int:
-    """Return the discount percentage for a given total item count."""
-    for threshold, percent in _DISCOUNT_TIERS:
+    tiers = db.list_discount_tiers()
+    for threshold, percent in tiers:
         if total_quantity >= threshold:
             return percent
     return 0
 
 
 def calculate_order(
-    items: Sequence[tuple[str, int]],
+    items: Sequence[tuple[str, int] | tuple[str, int, Decimal | str | None]],
 ) -> OrderCalculation:
-    """Compute full pricing for a list of (size, quantity) pairs.
-
-    Parameters
-    ----------
-    items:
-        Each element is a (size_key, quantity) pair. The size_key must exist
-        in BASE_PRICES. Quantity must be a positive integer.
-
-    Returns
-    -------
-    OrderCalculation with all monetary fields rounded to 2 decimal places.
-
-    Raises
-    ------
-    PricingError
-        If a size key is unrecognized or a quantity is not positive.
-    """
+    """Compute pricing for (size, quantity) or (size, quantity, custom_unit_price) tuples."""
     if not items:
         raise PricingError("Order must contain at least one item.")
 
+    prices = size_prices_map(include_inactive=True)
     line_items: list[LineItem] = []
     subtotal = Decimal("0")
     total_quantity = 0
 
-    for size, quantity in items:
-        if size not in BASE_PRICES:
-            raise PricingError(
-                f"Unknown size '{size}'. "
-                f"Valid sizes: {', '.join(sorted(BASE_PRICES.keys()))}."
-            )
-        if quantity < 1:
-            raise PricingError(f"Quantity must be at least 1, got {quantity} for size '{size}'.")
+    for entry in items:
+        if len(entry) == 2:
+            size, quantity = entry
+            custom_price = None
+        else:
+            size, quantity, custom_price = entry
 
-        unit_price = BASE_PRICES[size]
+        if size not in prices and custom_price is None:
+            raise PricingError(f"Unknown size '{size}'.")
+        if quantity < 1:
+            raise PricingError(f"Quantity must be at least 1, got {quantity}.")
+
+        unit_price = Decimal(str(custom_price)) if custom_price is not None else prices[size]
         line_total = unit_price * quantity
-        line_items.append(
-            LineItem(size=size, unit_price=unit_price, quantity=quantity, line_total=line_total)
-        )
+        line_items.append(LineItem(size=size, unit_price=unit_price, quantity=quantity, line_total=line_total))
         subtotal += line_total
         total_quantity += quantity
 
     discount_percent = _resolve_discount(total_quantity)
-    discount_amount = (subtotal * discount_percent / 100).quantize(
-        Decimal("0.01"), rounding=ROUND_HALF_UP
-    )
+    discount_amount = (subtotal * discount_percent / 100).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     total = (subtotal - discount_amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    deposit = (total * DEPOSIT_FRACTION).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    deposit = (total * get_deposit_fraction()).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
     return OrderCalculation(
         line_items=line_items,
@@ -126,22 +129,3 @@ def calculate_order(
         total=total,
         deposit=deposit,
     )
-
-
-LABELS = {
-    "20x20": "20 × 20 mm", "40x40": "40 × 40 mm", "60x60": "60 × 60 mm",
-    "spacebar_key": "Spacebar key", "phone_back": "Phone back",
-}
-MAX_QUANTITY = 999
-COLORS = ("black", "white", "silver", "pink", "blue")
-MAX_ADDRESS = 300
-
-
-def catalog():
-    return {
-        "products": [{"key": key, "name": LABELS[key], "cents": int(price * 100)}
-                     for key, price in BASE_PRICES.items()],
-        "discounts": _DISCOUNT_TIERS,
-        "depositPercent": int(DEPOSIT_FRACTION * 100),
-        "maxQuantity": MAX_QUANTITY, "colors": COLORS, "maxAddress": MAX_ADDRESS,
-    }

@@ -1,31 +1,43 @@
-from urllib.parse import urlencode
+"""Telegram reply and inline keyboards for button-driven ordering."""
 from telebot import types
-from config import settings
+
+BROWSE_TEMPLATES = "🎨 Browse Templates"
+UPLOAD_ARTWORK = "📤 Upload Stickers"
+MY_CART = "🛒 My Cart"
+MY_ORDERS = "📦 My Orders"
+HELP = "❓ Help"
+MANAGE_ORDERS = "🛠 Manage Orders"
+ADMIN_PANEL = "⚙️ Admin Panel"
 
 
-SHOP = "Open sticker shop"
-UPLOAD_ARTWORK = "Upload artwork"
-MY_ORDERS = "My orders"
-HELP = "Help"
-MANAGE_ORDERS = "Manage orders"
-
-
-def shop_keyboard(*, staff=False, upload_id=None):
+def main_menu_keyboard(*, staff: bool = False):
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
-    if upload_id:
-        url = settings.webapp_url + "?" + urlencode({"draft": upload_id})
-        keyboard.add(types.KeyboardButton("Configure stickers", web_app=types.WebAppInfo(url=url)))
-    keyboard.add(types.KeyboardButton(SHOP, web_app=types.WebAppInfo(url=settings.webapp_url)))
-    keyboard.row(UPLOAD_ARTWORK, MY_ORDERS)
+    keyboard.row(BROWSE_TEMPLATES, UPLOAD_ARTWORK)
+    keyboard.row(MY_CART, MY_ORDERS)
     if staff:
-        keyboard.row(HELP, MANAGE_ORDERS)
+        keyboard.row(MANAGE_ORDERS, ADMIN_PANEL)
+        keyboard.row(HELP)
     else:
         keyboard.row(HELP)
     return keyboard
 
 
-def actions(rows):
-    keyboard = types.InlineKeyboardMarkup()
-    for text, key, value in rows:
-        keyboard.add(types.InlineKeyboardButton(text, **{key: value}))
-    return keyboard if rows else None
+def phone_share_keyboard():
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    keyboard.add(types.KeyboardButton("Share my phone number", request_contact=True))
+    return keyboard
+
+
+def location_share_keyboard():
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    keyboard.add(types.KeyboardButton("📍 Share my delivery location", request_location=True))
+    return keyboard
+
+
+def actions(rows, cols: int = 1):
+    if not rows:
+        return None
+    keyboard = types.InlineKeyboardMarkup(row_width=cols)
+    buttons = [types.InlineKeyboardButton(text, **{key: value}) for text, key, value in rows]
+    keyboard.add(*buttons)
+    return keyboard

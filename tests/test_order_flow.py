@@ -1,260 +1,282 @@
-"""Regression tests. External Telegram, storage, and database calls are isolated."""
-from contextlib import ExitStack
+"""Regression tests for the button-driven Telegram sticker bot."""
 from io import BytesIO
+import os
+from pathlib import Path
+import tempfile
 from unittest import TestCase
 from unittest.mock import patch
-import json
-import os
 from uuid import uuid4
 
 from PIL import Image
+from telebot import types
 
+TMP_DB = Path(tempfile.gettempdir()) / f"stickers_bot_test_{uuid4().hex}.db"
 TEST_ENV = {
-    "TELEGRAM_BOT_TOKEN": "123456:offline", "TELEGRAM_WEBHOOK_SECRET": "telegram-test",
-    "PA_DOMAIN": "shop.invalid", "WEBAPP_URL": "", "SUPABASE_URL": "https://store.invalid",
-    "SUPABASE_KEY": "offline", "ADMIN_TELEGRAM_IDS": "7",
+    "TELEGRAM_BOT_TOKEN": "123456:offline-test-token",
+    "STORAGE_CHANNEL_ID": "-1001234567890",
+    "ADMIN_TELEGRAM_IDS": "7",
+    "DATABASE_PATH": str(TMP_DB),
 }
+
 with patch.dict(os.environ, TEST_ENV):
-    import app
-    from bot import handlers
-    from bot.webapp_data import parse_webapp_data, PayloadValidationError
-    from config import load_config
+    import run
     from services import database as db, storage
-    from services.pricing import calculate_order
+
+bot = run.create_bot()
 
 
-class OrderFlowTests(TestCase):
+class ButtonBotTests(TestCase):
+    @classmethod
+    def tearDownClass(cls):
+        for suffix in ("", "-wal", "-shm"):
+            p = Path(str(TMP_DB) + suffix)
+            if p.exists():
+                p.unlink()
+
     def setUp(self):
-        self.client = app.app.test_client()
-        self.uid = str(uuid4())
-        self.payload = dict(upload_id=self.uid, customer_phone="+251 912 345 678", delivery_method="pickup",
-                            items=[dict(size="40x40", quantity=5)])
-        self.order = dict(id=str(uuid4()), items=[], subtotal="300", total="285", discount_percent=5,
-                          telegram_user_id=13, customer_phone="0912345678", deposit_amount="142.50",
-                          status="pending_deposit", deposit_paid=False, delivery_method="pickup")
+        with db.connect() as conn:
+            conn.execute("DELETE FROM orders")
+            conn.execute("DELETE FROM cart_templates")
+            conn.execute("DELETE FROM upload_items")
+            conn.execute("DELETE FROM upload_batches")
+            conn.execute("DELETE FROM user_sessions")
+            conn.execute("DELETE FROM users")
+            conn.execute("DELETE FROM payment_accounts")
+            conn.execute("DELETE FROM templates WHERE id LIKE 'custom-%'")
+            conn.execute("DELETE FROM sticker_sizes WHERE key = '80x80'")
 
-    def test_supabase_rest_url_is_normalized_to_project_root(self):
-        for url in ("https://store.invalid", "https://store.invalid/rest/v1/"):
-            with self.subTest(url=url), patch.dict(os.environ, TEST_ENV | {"SUPABASE_URL": url}):
-                self.assertEqual(load_config().supabase_url, "https://store.invalid")
-
-    def test_parse_and_price(self):
-        data = parse_webapp_data(json.dumps(self.payload))
-        self.assertEqual(data.customer_phone, "0912345678")
-        self.assertEqual(str(calculate_order([(i.size, i.quantity) for i in data.items]).deposit), "142.50")
-        for fields in ({"customer_phone": 12}, {"delivery_method": "delivery", "delivery_address": "  "},
-                       {"items": [{"size": [], "quantity": 1}]}, {"items": [{"size": "20x20", "quantity": True}]},
-                       {"items": [{"size": "spacebar_key", "quantity": 1, "keyboard_color": "orange"}]}):
-            with self.subTest(fields=fields), self.assertRaises(PayloadValidationError):
-                parse_webapp_data(json.dumps(self.payload | fields))
-
-    def test_telegram_replay_and_transient_error(self):
-        self.assertEqual(self.client.post("/webhook", json={"update_id": 1}).status_code, 403)
-        headers = {"X-Telegram-Bot-Api-Secret-Token": "telegram-test"}
-        with patch.object(db, "client") as client, patch.object(app.bot, "process_new_updates") as process:
-            rpc = client.return_value.rpc.return_value.execute
-            rpc.return_value.data = "claimed"
-            process.side_effect = TimeoutError()
-            def post():
-                return self.client.post("/webhook", json={"update_id": 1}, headers=headers).status_code
-            self.assertEqual(post(), 503)
-            process.side_effect = None
-            self.assertEqual(post(), 200)
-            rpc.return_value.data = "done"
-            self.assertEqual(post(), 200)
-            self.assertEqual(process.call_count, 2)
-
-    def test_removed_payment_endpoints(self):
-        self.assertEqual(self.client.post("/chapa-webhook", json={}).status_code, 404)
-        self.assertEqual(self.client.get("/chapa-webhook").status_code, 404)
-        self.assertEqual(self.client.get("/chapa-callback").status_code, 404)
-
-    def message(self, uid, **content):
-        message = {"message_id": 10, "date": 1, "chat": {"id": uid, "type": "private"},
-                   "from": {"id": uid, "is_bot": False, "first_name": "User"}, **content}
-        app.bot.process_new_updates([app.telebot.types.Update.de_json({"update_id": 10, "message": message})])
-
-    def test_start_opens_shop_and_staff_menu_is_restricted(self):
-        with patch.object(app.bot, "send_message") as send, patch.object(db, "list_orders", return_value=[]) as orders:
-            for uid in (13, 7):
-                self.message(uid, text="/start")
-                markup = json.loads(send.call_args.kwargs["reply_markup"].to_json())
-                buttons = {button["text"]: button for row in markup["keyboard"] for button in row}
-                self.assertEqual(buttons["Open sticker shop"]["web_app"]["url"], app.settings.webapp_url)
-                self.assertIn("Upload artwork", buttons)
-                self.assertIn("My orders", buttons)
-                self.assertEqual("Manage orders" in buttons, uid == 7)
-            self.message(13, text="Manage orders")
-            orders.assert_not_called()
-            self.message(7, text="Manage orders")
-            orders.assert_called_once_with(0, None)
-
-    def test_storefront_shortcuts_use_the_chat_workflow(self):
-        page = self.client.get("/webapp")
-        self.assertEqual(page.status_code, 200)
-        self.assertIn(b"Custom stickers", page.data)
-        with patch.object(app.bot, "send_message") as send, patch.object(db, "list_orders", return_value=[]) as orders:
-            self.message(13, web_app_data={"data": "upload-artwork", "button_text": "Open sticker shop"})
-            self.assertIn("paperclip", send.call_args.args[1])
-            self.message(13, web_app_data={"data": "view-orders", "button_text": "Open sticker shop"})
-            self.assertIn("My orders", send.call_args.args[1])
-            self.message(13, text="My orders")
-            self.assertEqual([call.args for call in orders.call_args_list], [(0, 13), (0, 13)])
-
-    def test_upload_validation(self):
-        image = BytesIO()
-        Image.new("RGB", (2, 2)).save(image, "PNG")
-        self.assertEqual(storage.validate_image(image.getvalue(), "image/png"), image.getvalue())
-        with self.assertRaises(storage.ArtworkError):
-            storage.validate_image(image.getvalue(), "image/jpeg")
-        with self.assertRaises(storage.ArtworkError):
-            storage.validate_image(b'<svg xmlns="http://www.w3.org/2000/svg"><script/></svg>', "image/svg+xml")
-        self.assertTrue(storage.validate_image(b'<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0"/></svg>', "image/svg+xml"))
-
-    def test_submission_uses_owned_artwork_and_reuses_order(self):
-        bot = app.bot
-        message = {"message_id": 99, "date": 1, "chat": {"id": 13, "type": "private"},
-                   "from": {"id": 13, "is_bot": False, "first_name": "Test"},
-                   "web_app_data": {"data": json.dumps(self.payload), "button_text": "Configure stickers"}}
-        update = app.telebot.types.Update.de_json({"update_id": 99, "message": message})
-        upload = dict(id=self.uid, owner_id=13, extension="png")
-        with ExitStack() as stack:
-            lookup = stack.enter_context(patch.object(db, "order_by", return_value=None))
-            stack.enter_context(patch.object(db, "active_upload", return_value=upload))
-            create = stack.enter_context(patch.object(db, "save_order", side_effect=lambda data: data | {"id": self.order["id"]}))
-            send = stack.enter_context(patch.object(bot, "send_message"))
-            bot.process_new_updates([update])
-            data = create.call_args.args[0]
-            self.assertEqual(data["deposit_amount"], "142.50")
-            self.assertEqual(data["image_url"], storage.object_path(upload))
-            self.assertIn("142.50 ETB", send.call_args.args[1])
-            self.assertFalse(data["deposit_paid"])
-            self.assertIn("shop will contact you", send.call_args.args[1])
-            receipt_buttons = send.call_args.kwargs["reply_markup"].to_dict()["inline_keyboard"]
-            self.assertEqual(receipt_buttons[0][0]["text"], "Update phone number")
-            menu = json.loads(send.call_args_list[-2].kwargs["reply_markup"].to_json())
-            self.assertTrue(menu["is_persistent"])
-            lookup.return_value = data | {"id": self.order["id"], "chapa_checkout_url": "https://old.invalid/pay"}
-            bot.process_new_updates([update])
-            create.assert_called_once()
-            self.assertEqual(send.call_args.kwargs["reply_markup"].to_dict()["inline_keyboard"], receipt_buttons)
-            lookup.return_value = None
-            upload["owner_id"] = 14
-            bot.process_new_updates([update])
-            create.assert_called_once()
-            self.assertIn("unavailable", send.call_args.args[1])
-
-    def test_fulfillment(self):
-        self.assertIsNone(handlers.next_status(self.order))
-        ready = self.order | {"status": "out_for_delivery", "deposit_paid": True}
-        self.assertEqual(handlers.status_label(ready), "Ready for pickup")
-        self.assertEqual(handlers.next_status(ready), "completed")
-        self.assertEqual(handlers.status_label(ready | {"status": "completed"}), "Collected")
-        self.assertEqual(handlers.status_label(ready | {"delivery_method": "delivery"}), "Dispatched")
-
-    def test_form_hides_expired_draft(self):
-        with patch.object(db, "active_upload", return_value=None):
-            response = self.client.get("/webapp?draft=" + self.uid)
-            self.assertEqual(response.status_code, 200)
-            self.assertNotIn(b'<form id="form"', response.data)
+    def message(self, uid, message_id=10, **content):
+        msg = {
+            "message_id": message_id,
+            "date": 1,
+            "chat": {"id": uid, "type": "private"},
+            "from": {"id": uid, "is_bot": False, "first_name": "User"},
+            **content,
+        }
+        bot.process_new_updates([types.Update.de_json({"update_id": message_id, "message": msg})])
 
     def click(self, uid, data, chat_type="private"):
         user = {"id": uid, "is_bot": False, "first_name": "User"}
-        message = {"message_id": 2, "date": 1, "chat": {"id": uid, "type": chat_type}, "text": "Order"}
-        query = {"id": "button", "from": user, "chat_instance": "chat", "message": message, "data": data}
-        app.bot.process_new_updates([app.telebot.types.Update.de_json({"update_id": 2, "callback_query": query})])
+        msg = {"message_id": 2, "date": 1, "chat": {"id": uid, "type": chat_type}, "text": "Menu"}
+        query = {"id": "cb1", "from": user, "chat_instance": "chat", "message": msg, "data": data}
+        bot.process_new_updates([types.Update.de_json({"update_id": 2, "callback_query": query})])
 
-    def test_only_staff_can_confirm_deposit_once(self):
-        oid = self.order["id"]
-        button = f"deposit:{oid}"
-        paid = self.order | {"deposit_paid": True, "status": "deposit_confirmed"}
-        with ExitStack() as stack:
-            lookup = stack.enter_context(patch.object(db, "order_by", return_value=self.order))
-            record = stack.enter_context(patch.object(db, "confirm_deposit", return_value=paid))
-            notify = stack.enter_context(patch.object(handlers, "deliver_next"))
-            stack.enter_context(patch.object(db, "notification_status", return_value=None))
-            stack.enter_context(patch.object(storage, "print_url", return_value=None))
-            stack.enter_context(patch.object(app.bot, "answer_callback_query"))
-            send = stack.enter_context(patch.object(app.bot, "send_message"))
-            self.click(13, button)
-            self.click(7, button, "group")
-            lookup.assert_not_called()
-            self.click(7, f"staff:{oid}")
-            keyboard = send.call_args.kwargs["reply_markup"].to_dict()["inline_keyboard"]
-            self.assertIn(button, [b["callback_data"] for row in keyboard for b in row])
-            for old_action, uid in (("pay", 13), ("checkpay", 13), ("reconcile", 7)):
-                self.click(uid, f"{old_action}:{oid}")
-            record.assert_not_called()
-            self.click(7, button)
-            record.assert_called_once_with(self.order)
-            self.assertIn("Deposit received", send.call_args.args[1])
-            lookup.return_value = paid
-            self.click(7, button)
-            record.assert_called_once()
-            notify.assert_called_once_with(app.bot, oid)
-            self.assertIn("already recorded", send.call_args.args[1])
+    def register_user(self, uid=13, name="Leul Kassahun", phone="0912345678"):
+        db.set_user_name(uid, name)
+        db.complete_registration(uid, phone)
 
-    def test_confirmation_preserves_historical_fulfillment_stage(self):
-        for stage in ("pending_deposit", "printing", "out_for_delivery", "completed"):
-            order = self.order | {"status": stage, "deposit_paid": None}
-            with self.subTest(stage=stage), patch.object(db, "client") as client:
-                update = client.return_value.table.return_value.update
-                db.confirm_deposit(order)
-                values = update.call_args.args[0]
-                self.assertTrue(values["deposit_paid"])
-                if stage == "pending_deposit":
-                    self.assertEqual(values["status"], "deposit_confirmed")
-                else:
-                    self.assertNotIn("status", values)
+    def test_start_registration_flow(self):
+        with patch.object(bot, "send_message") as send:
+            self.message(13, message_id=1, text="/start")
+            self.assertIn("full name", send.call_args.args[1])
+            self.message(13, message_id=2, text="Leul Kassahun")
+            self.assertIn("phone number", send.call_args.args[1])
+            self.message(13, message_id=3, text="+251 912 345 678")
+            self.assertIn("Registration complete", send.call_args.args[1])
+            user = db.get_user(13)
+            self.assertEqual(user["full_name"], "Leul Kassahun")
+            self.assertEqual(user["phone"], "0912345678")
 
-    def test_staff_button_enforces_access_and_reports_delivery(self):
-        order = self.order | {"status": "printing", "deposit_paid": True}
-        button = f"advance:{order['id']}:out_for_delivery"
-        with ExitStack() as stack:
-            lookup = stack.enter_context(patch.object(db, "order_by", return_value=order))
-            advance = stack.enter_context(patch.object(db, "advance_order", return_value=order))
-            stack.enter_context(patch.object(db, "notification_status", return_value="failed"))
-            notify = stack.enter_context(patch.object(handlers, "deliver_next"))
-            stack.enter_context(patch.object(app.bot, "answer_callback_query"))
-            send = stack.enter_context(patch.object(app.bot, "send_message"))
-            self.click(8, button)
-            self.click(7, button, "group")
-            lookup.assert_not_called()
-            self.click(7, button)
-            advance.assert_called_once_with(order, "out_for_delivery", 7, None)
-            notify.assert_called_once()
-            self.assertIn("Notification failed", send.call_args.args[1])
-            order["deposit_paid"] = False
-            self.click(7, button)
-            advance.assert_called_once()
+    def test_upload_stores_name_and_phone_and_bulk_checkout(self):
+        self.register_user(13, "Leul Kassahun", "0912345678")
+        png_bytes = BytesIO()
+        Image.new("RGB", (4, 4)).save(png_bytes, "PNG")
 
-    def test_customer_receipt_requires_ownership(self):
-        owner = 13
-        call = {"id": "button", "from": {"id": owner, "is_bot": False, "first_name": "Test"},
-                "chat_instance": "chat", "data": f"mine:{self.order['id']}",
-                "message": {"message_id": 1, "date": 1, "chat": {"id": owner, "type": "private"}, "text": "Orders"}}
-        with patch.object(db, "order_by", return_value=self.order | {"telegram_user_id": 14}), \
-                patch.object(app.bot, "answer_callback_query"), patch.object(app.bot, "send_message") as send:
-            app.bot.process_new_updates([app.telebot.types.Update.de_json({"update_id": 42, "callback_query": call})])
-            self.assertEqual(send.call_args.args, (owner, "Order unavailable."))
+        with patch.object(storage, "download_telegram_file", return_value=png_bytes.getvalue()), \
+             patch.object(storage, "store_in_channel", side_effect=[("f_1", 101), ("f_2", 102)]) as store_mock, \
+             patch.object(bot, "send_message") as send, \
+             patch.object(bot, "send_photo") as send_photo, \
+             patch.object(bot, "answer_callback_query"), \
+             patch.object(bot, "edit_message_caption") as edit_cap:
+            for idx, name in enumerate(("a.png", "b.png"), 1):
+                self.message(
+                    13,
+                    message_id=20 + idx,
+                    document={
+                        "file_id": f"orig_{idx}",
+                        "file_unique_id": f"uniq_{idx}",
+                        "file_name": name,
+                        "mime_type": "image/png",
+                        "file_size": 100,
+                    },
+                )
+            self.assertEqual(store_mock.call_args.kwargs["full_name"], "Leul Kassahun")
+            self.assertEqual(store_mock.call_args.kwargs["phone"], "0912345678")
+            batch = db.get_open_batch(13)
+            self.assertEqual(len(db.list_batch_items(batch["id"])), 2)
 
-    def test_phone_button_only_uses_replies_to_the_bot(self):
-        order_id = self.order["id"]
-        updated = self.order | {"customer_phone": "0712345678"}
-        with ExitStack() as stack:
-            stack.enter_context(patch.object(db, "order_by", return_value=self.order))
-            save = stack.enter_context(patch.object(db, "correct_contact_phone", return_value=updated))
-            stack.enter_context(patch.object(app.bot, "answer_callback_query"))
-            send = stack.enter_context(patch.object(app.bot, "send_message"))
-            self.click(7, f"phone:{order_id}")
-            self.assertIn("unavailable", send.call_args.args[1])
-            self.click(13, f"phone:{order_id}")
-            self.assertTrue(json.loads(send.call_args.kwargs["reply_markup"].to_json())["force_reply"])
-            prompt = {"message_id": 11, "date": 1, "chat": {"id": 13, "type": "private"},
-                      "from": {"id": 13, "is_bot": False, "first_name": "User"}, "text": send.call_args.args[1]}
-            self.message(13, text="+251 712 345 678", reply_to_message=prompt)
-            save.assert_not_called()
-            prompt["from"] = {"id": int(app.bot.token.partition(":")[0]), "is_bot": True, "first_name": "Shop"}
-            self.message(13, text="+251 712 345 678", reply_to_message=prompt)
-            save.assert_called_once_with(self.order, 13, "0712345678")
-            self.assertIn("0712345678", send.call_args.args[1])
+            # Bulk size all 2 stickers as 40x40, 3 each (total 6 -> 5% discount: 360 - 18 = 342.00)
+            self.click(13, f"cfg:mode:{batch['id']}")
+            self.click(13, f"cfg:bulk:{batch['id']}")
+            self.click(13, f"cfg:bsize:{batch['id']}:40x40")
+            self.click(13, f"cfg:bqty:{batch['id']}:40x40:_:3")
+            self.assertIn("342.00 ETB", send.call_args.args[1])
+
+            # Checkout pickup -> place order
+            self.click(13, "checkout:pickup")
+            self.click(13, "checkout:place")
+            orders = db.list_orders(0, owner_id=13)
+            self.assertEqual(len(orders), 1)
+            order = orders[0]
+            self.assertEqual(order["total"], "342.00")
+            self.assertEqual(order["customer_name"], "Leul Kassahun")
+            self.assertEqual(edit_cap.call_count, 2)
+            self.assertIn("Leul Kassahun", edit_cap.call_args.kwargs["caption"])
+            self.assertIn("0912345678", edit_cap.call_args.kwargs["caption"])
+
+    def test_individual_sizing_and_template_cart_and_fulfillment(self):
+        self.register_user(13, "Leul Kassahun", "0912345678")
+        batch = db.get_or_create_open_batch(13)
+        db.add_upload_item(batch["id"], 13, 1, 50, "chan_f1", "one.png", "image/png", "png")
+
+        with patch.object(bot, "send_message"), \
+             patch.object(bot, "answer_callback_query"), \
+             patch.object(bot, "edit_message_caption"):
+            # Individual sizing for 1 sticker
+            self.click(13, f"cfg:indiv:{batch['id']}:0")
+            self.click(13, f"cfg:isize:{batch['id']}:0:20x20")
+            self.click(13, f"cfg:iqty:{batch['id']}:0:20x20:_:2")
+
+            # Add template via buttons (new format: tpl:add:<id>:<size>:<qty>)
+            self.click(13, "tpl:cats")
+            self.click(13, "tpl:cat:tech")
+            self.click(13, "tpl:pick:dev-terminal")
+            self.click(13, "tpl:add:dev-terminal:40x40:3")
+
+            # Checkout -> place (2*40 + 3*60 = 260, 5 total -> 5% discount = 247.00)
+            self.click(13, "checkout:pickup")
+            self.click(13, "checkout:place")
+            order = db.list_orders(0, owner_id=13)[0]
+            self.assertEqual(order["total"], "247.00")
+
+            # Staff fulfillment
+            self.click(7, f"deposit:{order['id']}")
+            self.click(7, f"advance:{order['id']}:printing")
+            self.click(7, f"advance:{order['id']}:out_for_delivery")
+            self.click(7, f"settle:{order['id']}:cash")
+            done = db.order_by_id(order["id"])
+            self.assertEqual(done["status"], "completed")
+            self.assertEqual(done["balance_method"], "cash")
+
+    def test_upload_validation_rejects_bad_svg(self):
+        with self.assertRaises(storage.ArtworkError):
+            storage.validate_image(b'<svg xmlns="http://www.w3.org/2000/svg"><script/></svg>', "image/svg+xml")
+
+    def test_visual_contact_sheet_and_preview_generation(self):
+        img_bytes = BytesIO()
+        Image.new("RGB", (64, 64), (200, 50, 50)).save(img_bytes, "PNG")
+        items = [
+            {"id": "1", "file_id": "f1", "file_name": "a.png", "extension": "png", "size": "40x40", "quantity": 2},
+            {"id": "2", "file_id": "f2", "file_name": "b.png", "extension": "png", "size": None, "quantity": 1},
+        ]
+        with patch.object(storage, "download_telegram_file", return_value=img_bytes.getvalue()):
+            sheet = storage.build_batch_contact_sheet(bot, items)
+            self.assertIsNotNone(sheet)
+            with Image.open(BytesIO(sheet)) as out:
+                self.assertEqual(out.format, "PNG")
+            preview = storage.build_sticker_preview(bot, items[0])
+            self.assertIsNotNone(preview)
+
+    def test_admin_crud_templates_pricing_and_payment_accounts(self):
+        self.register_user(13, "Leul Kassahun", "0912345678")
+        # 1. Admin creates a payment account
+        with patch.object(bot, "send_message") as send, \
+             patch.object(bot, "send_photo"), \
+             patch.object(bot, "answer_callback_query"):
+            self.click(7, "adm:pay_add")
+            self.message(7, message_id=201, text="CBE")
+            self.message(7, message_id=202, text="Sticker Shop PLC")
+            self.message(7, message_id=203, text="1000123456789")
+            self.message(7, message_id=204, text="Send screenshot after transfer")
+            accs = db.list_payment_accounts()
+            self.assertEqual(len(accs), 1)
+            self.assertEqual(accs[0]["label"], "CBE")
+
+            # 2. Admin adds a new size (80x80 -> 100 ETB)
+            self.click(7, "adm:size_add")
+            self.message(7, message_id=205, text="80x80")
+            self.message(7, message_id=206, text="100")
+            self.assertEqual(db.get_size("80x80")["price_etb"], "100.00")
+
+            # 3. Admin adds a template with sample photo stored in channel
+            with patch.object(storage, "store_template_sample", return_value=("sample_fid_1", 900)) as store_sample:
+                self.click(7, "adm:tpl_newcat")
+                self.message(7, message_id=207, text="Cars")
+                self.message(
+                    7,
+                    message_id=208,
+                    photo=[{"file_id": "raw_photo_1", "file_unique_id": "up1", "width": 100, "height": 100}],
+                )
+                store_sample.assert_called_once()
+                self.message(7, message_id=209, text="BMW M4")
+                self.message(7, message_id=210, text="Technical blueprint")
+                self.click(7, "adm:tpl_nsize:80x80")
+                self.message(7, message_id=211, text="120")
+
+            cars = db.list_templates_by_category("cars")
+            self.assertEqual(len(cars), 1)
+            tpl = cars[0]
+            self.assertEqual(tpl["sample_file_id"], "sample_fid_1")
+            self.assertEqual(tpl["custom_price"], "120.00")
+
+        # 4. Customer opens template -> sees sample photo + custom price -> places order -> sees CBE account
+        with patch.object(bot, "send_photo") as send_photo, \
+             patch.object(bot, "send_message") as send_msg, \
+             patch.object(bot, "answer_callback_query"):
+            self.click(13, f"tpl:pick:{tpl['id']}")
+            send_photo.assert_called_once()
+            self.assertEqual(send_photo.call_args.args[1], "sample_fid_1")
+            self.assertIn("120.00 ETB", send_photo.call_args.kwargs["caption"])
+
+            self.click(13, f"tpl:add:{tpl['id']}:80x80:1")
+            self.click(13, "checkout:pickup")
+            self.click(13, "checkout:place")
+            receipt_msg = [c.args[1] for c in send_msg.call_args_list if "1000123456789" in c.args[1]]
+            self.assertTrue(receipt_msg)
+
+    def test_payment_screenshot_sends_order_package_to_channel(self):
+        self.register_user(13, "Leul Kassahun", "0912345678")
+        batch = db.get_or_create_open_batch(13)
+        db.add_upload_item(batch["id"], 13, 1, 50, "chan_f1", "car.png", "image/png", "png")
+        db.update_upload_item_config(db.list_batch_items(batch["id"])[0]["id"], "40x40", 2, None)
+
+        with patch.object(bot, "send_message"), \
+             patch.object(bot, "answer_callback_query"), \
+             patch.object(bot, "edit_message_caption"):
+            self.click(13, "checkout:pickup")
+            self.click(13, "checkout:place")
+            order = db.list_orders(0, owner_id=13)[0]
+
+            # Customer sends payment screenshot
+            with patch.object(bot, "send_media_group") as send_group, \
+                 patch.object(bot, "send_photo") as send_photo, \
+                 patch.object(bot, "send_document"):
+                fake_photo_msg = type("Msg", (), {"message_id": 777, "photo": [type("P", (), {"file_id": "chan_shot_1"})()]})()
+                send_group.return_value = [fake_photo_msg]
+
+                self.click(13, f"payshot:{order['id']}")
+                self.message(
+                    13,
+                    message_id=300,
+                    photo=[{"file_id": "user_shot_1", "file_unique_id": "us1", "width": 200, "height": 200}],
+                )
+
+                # Channel received media group(s) with HTML bold/italic caption
+                chan_group_calls = [c for c in send_group.call_args_list if c.args[0] == -1001234567890]
+                self.assertEqual(len(chan_group_calls), 2)
+                photo_media = chan_group_calls[0].args[1]
+                cap = photo_media[0].caption
+                self.assertIn("<b>", cap)
+                self.assertIn("<i>", cap)
+                self.assertIn(order["id"][:8], cap)
+                self.assertIn("Leul Kassahun", cap)
+                self.assertIn("13", cap)
+                self.assertIn("0912345678", cap)
+                self.assertIn("car.png", cap)
+
+                # Staff (id=7) also received the payment screenshot
+                staff_photo_calls = [c for c in send_photo.call_args_list if c.args[0] == 7]
+                self.assertEqual(len(staff_photo_calls), 1)
+
+                updated = db.order_by_id(order["id"])
+                self.assertEqual(updated["payment_screenshot_file_id"], "chan_shot_1")
